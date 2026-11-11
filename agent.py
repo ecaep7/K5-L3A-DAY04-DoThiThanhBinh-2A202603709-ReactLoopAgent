@@ -15,9 +15,9 @@ def run_agent(question, provider, tools, max_steps=6):
         {'role': 'user', 'content': question},
     ]
     trace, usage = [], []
+    seen_urls = [] 
 
     for step in range(1, max_steps + 1):
-        # (1) Lỗi provider (mất mạng, sai key, hết quota...) -> dừng run
         try:
             response = provider.complete(messages, SCHEMAS)
         except Exception as exc:
@@ -32,8 +32,19 @@ def run_agent(question, provider, tools, max_steps=6):
 
         if not response['calls']:
             if response['finish'] == 'stop':
-                return {'status': 'completed',
-                        'answer': response['message'].get('content') or '',
+                answer = response['message'].get('content') or ''
+                # (5) Kiểm tra nguồn: answer phải chứa URL của mọi incident đã đọc
+                missing = [u for u in seen_urls if u not in answer]
+                if missing:
+                    trace.append({'event': 'validation_missing_source', 'step': step,
+                                  'missing_urls': missing})
+                    messages.append({'role': 'user', 'content':
+                        'Câu trả lời chưa dẫn URL nguồn của các incident đã đọc: '
+                        + ', '.join(missing)
+                        + '. Hãy viết lại câu trả lời hoàn chỉnh, giữ nguyên nội dung '
+                          'và thêm các URL này vào phần nguồn. Không bịa URL khác.'})
+                    continue   # gọi model thêm 1 lần nữa (nếu còn lượt)
+                return {'status': 'completed', 'answer': answer,
                         'trace': trace, 'usage': usage}
             # (2) Model dừng bất thường, ví dụ bị cắt output (finish == 'length')
             trace.append({'event': 'abnormal_finish', 'step': step, 'finish': response['finish']})
@@ -52,10 +63,17 @@ def run_agent(question, provider, tools, max_steps=6):
             except Exception as exc:
                 result = {'ok': False, 'error': type(exc).__name__, 'message': str(exc)[:200]}
 
+            # (5) Ghi nhận URL nguồn từ get_incident_details thành công
+            if call['name'] == 'get_incident_details' and result.get('ok') and result.get('url'):
+                if result['url'] not in seen_urls:
+                    seen_urls.append(result['url'])
+
             trace.append({'event': 'tool', 'step': step, 'name': call['name'],
                           'arguments': call['arguments'], 'result': result})
             messages.append({'role': 'tool',
                              'tool_call_id': call['id'],
                              'content': json.dumps(result, ensure_ascii=False)})
+
+    # (4) Hết số lần gọi model mà chưa có câu trả lời cuối
     trace.append({'event': 'max_steps', 'step': max_steps})
     return {'status': 'max_steps', 'answer': '', 'trace': trace, 'usage': usage}
